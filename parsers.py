@@ -3,8 +3,9 @@
 Handles the messy reality of ERP 'Excel' exports:
   - real .xlsx (openpyxl)
   - legacy binary .xls (xlrd)
-  - HTML tables saved as .xls (read_html)
-  - CSV/TSV in disguise (read_csv with delimiter sniffing)
+  - Excel 2003 XML Spreadsheet (<?xml><Workbook>)
+  - HTML tables saved as .xls
+  - CSV / TSV / pipe-delimited in disguise
 """
 from __future__ import annotations
 
@@ -63,13 +64,91 @@ def _extract_po(text):
 
 
 # ----------------------------------------------------------------------------
-# Universal loader — sniffs the real file type regardless of extension
+# Header finder — tolerant of case, whitespace, punctuation, merged cells
+# ----------------------------------------------------------------------------
+_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(s) -> str:
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    return _NORMALIZE_RE.sub("", str(s).lower())
+
+
+def _find_header_row(raw: pd.DataFrame, wanted: set[str], scan: int = 200) -> int | None:
+    wanted_norm = {_norm(w) for w in wanted}
+    for i in range(min(scan, len(raw))):
+        row_cells = [_norm(v) for v in raw.iloc[i].tolist()]
+        row_blob = "|".join(row_cells)
+        if all(
+            any(w in c for c in row_cells) or w in row_blob
+            for w in wanted_norm
+        ):
+            return i
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Excel 2003 XML Spreadsheet reader
+# ----------------------------------------------------------------------------
+def _read_xml_spreadsheet(content: bytes) -> list[pd.DataFrame]:
+    from xml.etree import ElementTree as ET
+
+    text = content.decode("utf-8", errors="ignore")
+    start = text.find("<?xml")
+    if start > 0:
+        text = text[start:]
+    text = re.sub(r"<!DOCTYPE[^>]*>", "", text, flags=re.IGNORECASE)
+
+    root = ET.fromstring(text)
+
+    def _local(tag: str) -> str:
+        return tag.split("}", 1)[-1]
+
+    sheets: list[pd.DataFrame] = []
+    for ws in root.iter():
+        if _local(ws.tag) != "Worksheet":
+            continue
+        rows: list[list] = []
+        for row in ws.iter():
+            if _local(row.tag) != "Row":
+                continue
+            cells: list = []
+            for cell in row:
+                if _local(cell.tag) != "Cell":
+                    continue
+                idx = cell.attrib.get(
+                    "{urn:schemas-microsoft-com:office:spreadsheet}Index"
+                ) or cell.attrib.get("Index")
+                if idx:
+                    try:
+                        want = int(idx) - 1
+                        while len(cells) < want:
+                            cells.append(None)
+                    except ValueError:
+                        pass
+                data = None
+                for d in cell:
+                    if _local(d.tag) == "Data":
+                        data = d.text
+                        break
+                cells.append(data)
+            rows.append(cells)
+
+        if not rows:
+            continue
+
+        width = max(len(r) for r in rows)
+        rows = [r + [None] * (width - len(r)) for r in rows]
+        sheets.append(pd.DataFrame(rows, dtype=object))
+
+    return [s for s in sheets if not s.empty]
+
+
+# ----------------------------------------------------------------------------
+# Universal loader
 # ----------------------------------------------------------------------------
 def load_any(file, nrows=None) -> list[pd.DataFrame]:
-    """
-    Return a list of raw DataFrames (one per sheet / HTML table / CSV chunk),
-    with no header assumption — caller finds the header row itself.
-    """
     if hasattr(file, "read"):
         content = file.read()
         name = getattr(file, "name", "uploaded")
@@ -78,9 +157,10 @@ def load_any(file, nrows=None) -> list[pd.DataFrame]:
             content = f.read()
         name = str(file)
 
-    head = content[:2048].lstrip()
+    head = content[:4096].lstrip()
+    head_l = head[:1024].decode("utf-8", errors="ignore").lower()
 
-    # 1. Real XLSX / XLSM (zip container starting with PK)
+    # 1. XLSX (zip)
     if head[:2] == b"PK":
         try:
             xls = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
@@ -91,7 +171,7 @@ def load_any(file, nrows=None) -> list[pd.DataFrame]:
         except Exception:
             pass
 
-    # 2. Legacy binary XLS (D0 CF 11 E0 ...)
+    # 2. Legacy binary XLS
     if head[:4] == b"\xd0\xcf\x11\xe0":
         try:
             xls = pd.ExcelFile(io.BytesIO(content), engine="xlrd")
@@ -102,22 +182,27 @@ def load_any(file, nrows=None) -> list[pd.DataFrame]:
         except Exception:
             pass
 
-    # 3. HTML table saved as .xls (very common in ERP "Export to Excel")
-    text_head = head[:512].decode("utf-8", errors="ignore").lower()
-    if ("<html" in text_head or "<table" in text_head
-            or "<?xml" in text_head or "<tr" in text_head):
+    # 3. Excel 2003 XML Spreadsheet
+    if head_l.startswith("<?xml") and ("spreadsheet" in head_l or "workbook" in head_l):
         try:
-            tables = pd.read_html(io.BytesIO(content), header=None, flavor="bs4")
-            return [t for t in tables if not t.empty]
+            result = _read_xml_spreadsheet(content)
+            if result:
+                return result
         except Exception:
-            # try with lxml
-            try:
-                tables = pd.read_html(io.BytesIO(content), header=None, flavor="lxml")
-                return [t for t in tables if not t.empty]
-            except Exception:
-                pass
+            pass
 
-    # 4. CSV / TSV in disguise — try several separators
+    # 4. HTML table
+    if any(tok in head_l for tok in ("<html", "<table", "<tr", "<thead", "<tbody")):
+        for flavor in ("bs4", "lxml", "html5lib"):
+            try:
+                tables = pd.read_html(io.BytesIO(content), header=None, flavor=flavor)
+                clean = [t for t in tables if not t.empty and t.shape[1] >= 3]
+                if clean:
+                    return clean
+            except Exception:
+                continue
+
+    # 5. CSV / TSV / pipe
     for sep in (",", ";", "\t", "|"):
         try:
             df = pd.read_csv(
@@ -130,33 +215,9 @@ def load_any(file, nrows=None) -> list[pd.DataFrame]:
             continue
 
     raise ValueError(
-        f"Could not read '{name}'. The file doesn't look like a real "
-        "XLSX, XLS, HTML, or CSV. Open it in Excel and 'Save As' → "
+        f"Could not read '{name}'. Open it in Excel and 'Save As' → "
         "Excel Workbook (.xlsx), then re-upload."
     )
-
-
-def _find_header_row(raw: pd.DataFrame, wanted: set[str], scan: int = 120) -> int | None:
-    for i in range(min(scan, len(raw))):
-        vals = {
-            str(v).strip().lower() if pd.notna(v) else ""
-            for v in raw.iloc[i].tolist()
-        }
-        if wanted.issubset(vals):
-            return i
-    return None
-
-
-def _find_header_row_fuzzy(raw: pd.DataFrame, wanted: set[str], scan: int = 120) -> int | None:
-    """Fallback: any cell in the row *contains* one of the wanted tokens."""
-    for i in range(min(scan, len(raw))):
-        row = " | ".join(
-            str(v).strip().lower() if pd.notna(v) else ""
-            for v in raw.iloc[i].tolist()
-        )
-        if all(w in row for w in wanted):
-            return i
-    return None
 
 
 # ----------------------------------------------------------------------------
@@ -181,9 +242,24 @@ GSCORE_COLMAP_HINTS = {
 def _gscore_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     header_row = _find_header_row(raw, {"date", "grn", "product"})
     if header_row is None:
-        header_row = _find_header_row_fuzzy(raw, {"date", "grn", "product"})
+        header_row = _find_header_row(raw, {"date", "grn"})
     if header_row is None:
-        raise ValueError("No GSCORE header row (needs Date, GRN, Product) found in sheet.")
+        header_row = _find_header_row(raw, {"grn", "product"})
+    if header_row is None:
+        for i in range(min(200, len(raw))):
+            row = raw.iloc[i].tolist()
+            if any(
+                isinstance(v, str) and re.match(r"\d{4}-\d{2}-\d{2}", v.strip())
+                for v in row if pd.notna(v)
+            ):
+                header_row = max(0, i - 1)
+                break
+
+    if header_row is None:
+        raise ValueError(
+            "No GSCORE header row found. First 5 rows were:\n"
+            + raw.head(5).to_string()
+        )
 
     header = [
         str(v).strip() if pd.notna(v) else f"col{j}"
@@ -204,9 +280,10 @@ def _gscore_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
                 break
     df = df.rename(columns=rename)
 
-    if not {"Date", "GRN", "Product"}.issubset(df.columns):
+    if not {"Date", "GRN"}.issubset(df.columns):
         raise ValueError(
-            f"GSCORE sheet missing required columns. Found: {list(df.columns)}"
+            f"GSCORE sheet found header at row {header_row} but is missing "
+            f"required columns. Columns seen: {list(df.columns)}"
         )
 
     df = df[df["GRN"].astype(str).str.upper().str.startswith("GRN", na=False)].copy()
@@ -226,7 +303,6 @@ def _gscore_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_gscore(file) -> pd.DataFrame:
-    """Parse a GSCORE 'Purchase Analysis' export — any file format."""
     sheets = load_any(file)
     errors = []
     for i, raw in enumerate(sheets):
@@ -248,8 +324,7 @@ def parse_gscore(file) -> pd.DataFrame:
 def _xero_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     header_row = _find_header_row(raw, {"date", "description", "debit"})
     if header_row is None:
-        # fuzzy: any row whose text contains date/description/debit
-        for i in range(min(120, len(raw))):
+        for i in range(min(200, len(raw))):
             row = " | ".join(
                 str(v).strip().lower() if pd.notna(v) else ""
                 for v in raw.iloc[i].tolist()
@@ -293,7 +368,7 @@ def _xero_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     if "Date" not in df.columns or "Description" not in df.columns:
         raise ValueError(
-            f"XERO sheet missing Date / Description. Found: {list(df.columns)}"
+            f"XERO sheet missing Date / Description. Columns seen: {list(df.columns)}"
         )
 
     df["Date"] = df["Date"].apply(_to_date)
@@ -338,7 +413,6 @@ def _xero_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_xero(file) -> pd.DataFrame:
-    """Parse a XERO 'Account Transactions' export — any file format."""
     sheets = load_any(file)
     errors = []
     for i, raw in enumerate(sheets):
